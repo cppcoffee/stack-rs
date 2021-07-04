@@ -1,55 +1,63 @@
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+
+use crossbeam_epoch::{self as epoch, Atomic, Owned};
 
 unsafe impl<T: Send> Sync for Stack<T> {}
 
 struct Node<T: Send> {
-    next: AtomicPtr<Node<T>>,
+    next: Atomic<Node<T>>,
     value: Option<T>,
 }
 
 impl<T: Send> Node<T> {
-    fn new(x: T) -> Self {
+    fn new(v: T) -> Self {
         Self {
-            next: AtomicPtr::default(),
-            value: Some(x),
+            next: Atomic::null(),
+            value: Some(v),
         }
     }
 
-    fn sentry() -> Self {
+    fn sentinel() -> Self {
         Self {
-            next: AtomicPtr::default(),
+            next: Atomic::null(),
             value: None,
         }
     }
 }
 
 pub struct Stack<T: Send> {
-    top: AtomicPtr<Node<T>>,
+    top: Atomic<Node<T>>,
 }
 
 impl<T: Send> Stack<T> {
     pub fn new() -> Self {
-        let dummy = Box::into_raw(Box::new(Node::sentry()));
+        let s = Stack {
+            top: Atomic::null(),
+        };
 
-        Stack {
-            top: AtomicPtr::new(dummy),
-        }
+        let sentinel = Owned::new(Node::sentinel());
+        let guard = unsafe { &epoch::unprotected() };
+
+        let sentinel = sentinel.into_shared(guard);
+        s.top.store(sentinel, Relaxed);
+        s
     }
 
-    pub fn push(&self, x: T) {
-        unsafe { self.try_push(x) }
+    pub fn push(&self, v: T) {
+        unsafe { self.try_push(v) }
     }
 
-    unsafe fn try_push(&self, x: T) {
-        let node = Box::leak(Box::new(Node::new(x)));
+    unsafe fn try_push(&self, v: T) {
+        let guard = &epoch::pin();
+        let node = Owned::new(Node::new(v)).into_shared(guard);
 
         loop {
-            let top_ptr = self.top.load(Ordering::Acquire);
-            node.next.store(top_ptr, Ordering::Relaxed);
+            let top_ptr = self.top.load(Acquire, guard);
+            (*node.as_raw()).next.store(top_ptr, Relaxed);
 
             if self
                 .top
-                .compare_exchange(top_ptr, node, Ordering::Release, Ordering::Relaxed)
+                .compare_exchange(top_ptr, node, Release, Relaxed, guard)
                 .is_ok()
             {
                 break;
@@ -62,9 +70,11 @@ impl<T: Send> Stack<T> {
     }
 
     unsafe fn try_pop(&self) -> Option<T> {
+        let guard = &epoch::pin();
+
         loop {
-            let top_ptr = self.top.load(Ordering::Acquire);
-            let next_ptr = (*top_ptr).next.load(Ordering::Acquire);
+            let top_ptr = self.top.load(Acquire, guard);
+            let next_ptr = (*top_ptr.as_raw()).next.load(Acquire, guard);
 
             if next_ptr.is_null() {
                 return None;
@@ -72,25 +82,11 @@ impl<T: Send> Stack<T> {
 
             if self
                 .top
-                .compare_exchange(top_ptr, next_ptr, Ordering::Release, Ordering::Relaxed)
+                .compare_exchange(top_ptr, next_ptr, Release, Relaxed, guard)
                 .is_ok()
             {
-                let mut node = Box::from_raw(top_ptr);
-                return node.value.take();
-            }
-        }
-    }
-}
-
-impl<T: Send> Drop for Stack<T> {
-    fn drop(&mut self) {
-        let mut p = self.top.load(Ordering::Relaxed);
-
-        while !p.is_null() {
-            unsafe {
-                let next = (*p).next.load(Ordering::Relaxed);
-                Box::from_raw(p);
-                p = next;
+                let top_ptr = top_ptr.as_raw() as *mut Node<T>;
+                return (*top_ptr).value.take();
             }
         }
     }
